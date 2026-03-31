@@ -1,12 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import * as pipedrive from "pipedrive";
 import * as dotenv from 'dotenv';
 import Bottleneck from 'bottleneck';
 import jwt from 'jsonwebtoken';
 import http from 'http';
+import crypto from 'crypto';
 
 // Type for error handling
 interface ErrorWithMessage {
@@ -135,6 +137,7 @@ const usersApi = withRateLimit(new pipedrive.UsersApi(apiClient));
 const server = new McpServer({
   name: "pipedrive-mcp-server",
   version: "1.0.2",
+}, {
   capabilities: {
     resources: {},
     tools: {},
@@ -183,6 +186,7 @@ server.tool(
 );
 
 // Get deals with flexible filtering options
+// @ts-ignore - SDK type instantiation depth issue with complex zod schemas
 server.tool(
   "get-deals",
   "Get deals from Pipedrive with flexible filtering options including search by title, date range, owner, stage, status, and more. Use 'get-users' tool first to find owner IDs.",
@@ -454,6 +458,7 @@ server.tool(
 );
 
 // Search deals
+// @ts-ignore - SDK type instantiation depth issue
 server.tool(
   "search-deals",
   "Search deals by term",
@@ -963,8 +968,131 @@ server.prompt(
 // Get transport type from environment variable (default to stdio)
 const transportType = process.env.MCP_TRANSPORT || 'stdio';
 
-if (transportType === 'sse') {
-  // SSE transport - create HTTP server
+if (transportType === 'streamable-http') {
+  // Streamable HTTP transport (new MCP standard)
+  const port = parseInt(process.env.MCP_PORT || '3000', 10);
+
+  // Store active transports by session ID
+  const transports = new Map<string, StreamableHTTPServerTransport>();
+
+  const httpServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url!, `http://${req.headers.host}`);
+
+    // Enable CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    // Health check endpoint
+    if (req.method === 'GET' && url.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', transport: 'streamable-http' }));
+      return;
+    }
+
+    // All MCP traffic goes to /mcp
+    if (url.pathname !== '/mcp') {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+
+    // Verify JWT authentication
+    const authResult = verifyRequestAuthentication(req);
+    if (!authResult.ok) {
+      res.writeHead(authResult.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: authResult.message }));
+      return;
+    }
+
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    if (req.method === 'POST') {
+      // Read body
+      const body = await new Promise<string>((resolve, reject) => {
+        let data = '';
+        req.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+        req.on('end', () => resolve(data));
+        req.on('error', reject);
+      });
+
+      let parsedBody: any;
+      try {
+        parsedBody = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+        return;
+      }
+
+      // Check if this is an initialization request
+      const isInit = parsedBody?.method === 'initialize' ||
+        (Array.isArray(parsedBody) && parsedBody.some((m: any) => m.method === 'initialize'));
+
+      if (sessionId && transports.has(sessionId)) {
+        // Existing session
+        const transport = transports.get(sessionId)!;
+        await transport.handleRequest(req, res, parsedBody);
+      } else if (!sessionId && isInit) {
+        // New session
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => crypto.randomUUID(),
+          onsessioninitialized: (newSessionId: string) => {
+            transports.set(newSessionId, transport);
+            console.error(`Session initialized: ${newSessionId}`);
+          }
+        });
+
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid) {
+            console.error(`Session closed: ${sid}`);
+            transports.delete(sid);
+          }
+        };
+
+        await server.connect(transport);
+        await transport.handleRequest(req, res, parsedBody);
+      } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Bad Request: No valid session ID' }));
+      }
+    } else if (req.method === 'GET') {
+      // SSE stream for server-initiated messages
+      if (!sessionId || !transports.has(sessionId)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid or missing session ID' }));
+        return;
+      }
+      const transport = transports.get(sessionId)!;
+      await transport.handleRequest(req, res);
+    } else if (req.method === 'DELETE') {
+      // Session termination
+      if (!sessionId || !transports.has(sessionId)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid or missing session ID' }));
+        return;
+      }
+      const transport = transports.get(sessionId)!;
+      await transport.handleRequest(req, res);
+    } else {
+      res.writeHead(405);
+      res.end('Method not allowed');
+    }
+  });
+
+  httpServer.listen(port, () => {
+    console.error(`Pipedrive MCP Server (Streamable HTTP) listening on port ${port}`);
+    console.error(`MCP endpoint: http://localhost:${port}/mcp`);
+  });
+} else if (transportType === 'sse') {
+  // Legacy SSE transport
   const port = parseInt(process.env.MCP_PORT || '3000', 10);
   const endpoint = process.env.MCP_ENDPOINT || '/message';
 

@@ -11,9 +11,9 @@
     "generate-jwt": "node scripts/generate-jwt.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.7.1",
-    "dotenv": "^16.4.7",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "bottleneck": "^2.19.5",
+    "dotenv": "^16.4.7",
     "jsonwebtoken": "^9.0.2",
     "pipedrive": "^22.10.1",
     "ts-node": "^10.9.2",
